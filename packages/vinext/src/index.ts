@@ -19,7 +19,7 @@ import {
 
 import { findMiddlewareFile, runMiddleware } from "./server/middleware.js";
 import { findInstrumentationFile, runInstrumentation } from "./server/instrumentation.js";
-import { safeRegExp, isExternalUrl, proxyExternalRequest } from "./config/config-matchers.js";
+import { safeRegExp, escapeHeaderSource, isExternalUrl, proxyExternalRequest } from "./config/config-matchers.js";
 import { scanMetadataFiles } from "./server/metadata-routes.js";
 import { staticExportPages } from "./build/static-export.js";
 import tsconfigPaths from "vite-tsconfig-paths";
@@ -742,11 +742,17 @@ function matchMiddlewarePattern(pathname, pattern) {
     var re = __safeRegExp("^" + pattern + "$");
     if (re) return re.test(pathname);
   }
-  var regexStr = pattern
-    .replace(/\\./g, "\\\\.")
-    .replace(/\\/:([\\w]+)\\*/g, "(?:/.*)?")
-    .replace(/\\/:([\\w]+)\\+/g, "(?:/.+)")
-    .replace(/:([\\w]+)/g, "([^/]+)");
+  // Single-pass tokenizer (avoids chained .replace() flagged by CodeQL).
+  var regexStr = "";
+  var tokenRe = /\\/:([\\w]+)\\*|\\/:([\\w]+)\\+|:([\\w]+)|[.]|[^/:.]+|./g;
+  var tok;
+  while ((tok = tokenRe.exec(pattern)) !== null) {
+    if (tok[1] !== undefined) { regexStr += "(?:/.*)?"; }
+    else if (tok[2] !== undefined) { regexStr += "(?:/.+)"; }
+    else if (tok[3] !== undefined) { regexStr += "([^/]+)"; }
+    else if (tok[0] === ".") { regexStr += "\\\\."; }
+    else { regexStr += tok[0]; }
+  }
   var re2 = __safeRegExp("^" + regexStr + "$");
   return re2 ? re2.test(pathname) : pathname === pattern;
 }
@@ -1568,6 +1574,9 @@ ${middlewareExportCode}
     const loaderEntries = pageRoutes.map((r: Route) => {
       const absPath = r.filePath.replace(/\\/g, "/");
       const nextFormatPattern = pagesPatternToNextFormat(r.pattern);
+      // JSON.stringify safely escapes quotes, backslashes, and special chars in
+      // both the route pattern and the absolute file path.
+      // lgtm[js/bad-code-sanitization]
       return `  ${JSON.stringify(nextFormatPattern)}: () => import(${JSON.stringify(absPath)})`;
     });
 
@@ -3227,6 +3236,26 @@ function getNextPublicEnvDefines(): Record<string, string> {
 }
 
 /**
+ * If the current position in `str` starts with a parenthesized group, consume
+ * it and advance `re.lastIndex` past the closing `)`. Returns the group
+ * contents or null if no group is present.
+ */
+function extractConstraint(str: string, re: RegExp): string | null {
+  if (str[re.lastIndex] !== "(") return null;
+  const start = re.lastIndex + 1;
+  let depth = 1;
+  let i = start;
+  while (i < str.length && depth > 0) {
+    if (str[i] === "(") depth++;
+    else if (str[i] === ")") depth--;
+    i++;
+  }
+  if (depth !== 0) return null;
+  re.lastIndex = i;
+  return str.slice(start, i - 1);
+}
+
+/**
  * Match a Next.js route pattern (e.g. "/blog/:slug", "/docs/:path*") against a pathname.
  * Returns matched params or null.
  *
@@ -3257,28 +3286,40 @@ export function matchConfigPattern(
       // :param* -> (.*)
       // :param+ -> (.+)
       const paramNames: string[] = [];
-      const regexStr = pattern
-        .replace(/\./g, "\\.")
-        // :param* with optional constraint
-        .replace(/:(\w+)\*(?:\(([^)]+)\))?/g, (_m, name, constraint) => {
-          paramNames.push(name);
-          return constraint ? `(${constraint})` : "(.*)";
-        })
-        // :param+ with optional constraint
-        .replace(/:(\w+)\+(?:\(([^)]+)\))?/g, (_m, name, constraint) => {
-          paramNames.push(name);
-          return constraint ? `(${constraint})` : "(.+)";
-        })
-        // :param(constraint) — named param with inline regex constraint
-        .replace(/:(\w+)\(([^)]+)\)/g, (_m, name, constraint) => {
-          paramNames.push(name);
-          return `(${constraint})`;
-        })
-        // :param — plain named param
-        .replace(/:(\w+)/g, (_m, name) => {
-          paramNames.push(name);
-          return "([^/]+)";
-        });
+      // Single-pass conversion with procedural suffix handling. The tokenizer
+      // matches only simple, non-overlapping tokens; quantifier/constraint
+      // suffixes after :param are consumed procedurally to avoid polynomial
+      // backtracking in the regex engine.
+      let regexStr = "";
+      const tokenRe = /:(\w+)|[.]|[^:.]+/g;
+      let tok: RegExpExecArray | null;
+      while ((tok = tokenRe.exec(pattern)) !== null) {
+        if (tok[1] !== undefined) {
+          const name = tok[1];
+          const rest = pattern.slice(tokenRe.lastIndex);
+          // Check for quantifier (* or +) with optional constraint
+          if (rest.startsWith("*") || rest.startsWith("+")) {
+            const quantifier = rest[0];
+            tokenRe.lastIndex += 1;
+            const constraint = extractConstraint(pattern, tokenRe);
+            paramNames.push(name);
+            if (constraint !== null) {
+              regexStr += `(${constraint})`;
+            } else {
+              regexStr += quantifier === "*" ? "(.*)" : "(.+)";
+            }
+          } else {
+            // Check for inline constraint without quantifier
+            const constraint = extractConstraint(pattern, tokenRe);
+            paramNames.push(name);
+            regexStr += constraint !== null ? `(${constraint})` : "([^/]+)";
+          }
+        } else if (tok[0] === ".") {
+          regexStr += "\\.";
+        } else {
+          regexStr += tok[0];
+        }
+      }
       const re = safeRegExp("^" + regexStr + "$");
       if (!re) return null;
       const match = re.exec(pathname);
@@ -3306,7 +3347,9 @@ export function matchConfigPattern(
     // For :path+ we need at least one segment (non-empty after the prefix)
     if (isPlus && (!rest || rest === "/")) return null;
     // For :path* zero segments is fine
-    return { [paramName]: rest.startsWith("/") ? rest.slice(1) : rest };
+    let restValue = rest.startsWith("/") ? rest.slice(1) : rest;
+    try { restValue = decodeURIComponent(restValue); } catch { /* malformed percent-encoding */ }
+    return { [paramName]: restValue };
   }
 
   // Simple segment-based matching for exact patterns and :param
@@ -3449,24 +3492,7 @@ function applyHeaders(
   headers: Array<{ source: string; headers: Array<{ key: string; value: string }> }>,
 ): void {
   for (const rule of headers) {
-    // Escape regex metacharacters in the source, then convert Next.js patterns.
-    // Strategy: extract regex groups first, process the rest, then restore groups.
-    const groups: string[] = [];
-    const withPlaceholders = rule.source.replace(/\(([^)]+)\)/g, (_m, inner) => {
-      groups.push(inner);
-      return `___GROUP_${groups.length - 1}___`;
-    });
-    const escaped = withPlaceholders
-      // Escape dots and other metacharacters
-      .replace(/\./g, "\\.")
-      .replace(/\+/g, "\\+")
-      .replace(/\?/g, "\\?")
-      // Convert glob * to .*
-      .replace(/\*/g, ".*")
-      // Convert :param to [^/]+
-      .replace(/:\w+/g, "[^/]+")
-      // Restore regex groups (contents are untouched)
-      .replace(/___GROUP_(\d+)___/g, (_m, idx) => `(${groups[Number(idx)]})`);
+    const escaped = escapeHeaderSource(rule.source);
     const sourceRegex = safeRegExp("^" + escaped + "$");
     if (sourceRegex && sourceRegex.test(pathname)) {
       for (const header of rule.headers) {
